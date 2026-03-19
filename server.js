@@ -8,9 +8,8 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-const PORT = Number(process.env.PORT || 8080);
+const PORT = Number(process.env.PORT || 10000);
 const IMAGE_MODEL = process.env.FAL_IMAGE_MODEL || "fal-ai/flux/dev";
-const VIDEO_MODEL = process.env.FAL_VIDEO_MODEL || "wan/v2.6/text-to-video";
 
 if (!process.env.FAL_KEY) {
   throw new Error("Missing FAL_KEY environment variable");
@@ -20,16 +19,16 @@ fal.config({
   credentials: process.env.FAL_KEY,
 });
 
-function sendError(res, statusCode, message, extra = {}) {
-  return res.status(statusCode).json({
+function sendError(res, status, message, extra = {}) {
+  return res.status(status).json({
     error: message,
     ...extra,
   });
 }
 
 function toNumber(value, fallback) {
-  const number = Number(value);
-  return Number.isFinite(number) ? number : fallback;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
 }
 
 app.get("/", (_req, res) => {
@@ -40,10 +39,9 @@ app.get("/", (_req, res) => {
 });
 
 app.get("/health", (_req, res) => {
-  res.json({
+  res.status(200).json({
     ok: true,
-    imageModel: IMAGE_MODEL,
-    videoModel: VIDEO_MODEL,
+    model: IMAGE_MODEL,
   });
 });
 
@@ -58,6 +56,7 @@ app.post("/v1/ai/image/jobs", async (req, res) => {
     const height = toNumber(req.body?.height, 1024);
     const steps = toNumber(req.body?.steps, 28);
     const guidance = toNumber(req.body?.guidance, 3.5);
+
     const seed =
       req.body?.seed === null || req.body?.seed === undefined
         ? undefined
@@ -81,11 +80,11 @@ app.post("/v1/ai/image/jobs", async (req, res) => {
 
     return res.status(202).json({
       requestId: result.request_id,
-      type: "image",
       model: IMAGE_MODEL,
+      status: "IN_QUEUE",
     });
   } catch (error) {
-    console.error("IMAGE_SUBMIT_ERROR", error);
+    console.error("POST /v1/ai/image/jobs error:", error);
     return sendError(
       res,
       500,
@@ -111,13 +110,14 @@ app.get("/v1/ai/image/jobs/:requestId", async (req, res) => {
       });
     }
 
-    const result = await fal.queue.result(IMAGE_MODEL, { requestId });
+    const result = await fal.queue.result(IMAGE_MODEL, {
+      requestId,
+    });
+
     const image = result?.data?.images?.[0];
 
     if (!image?.url) {
-      return sendError(res, 502, "No image URL returned", {
-        data: result?.data ?? null,
-      });
+      return sendError(res, 502, "No image URL returned by fal");
     }
 
     return res.json({
@@ -127,111 +127,24 @@ app.get("/v1/ai/image/jobs/:requestId", async (req, res) => {
       height: image.height ?? null,
       contentType: image.content_type ?? "image/jpeg",
       seed: result?.data?.seed ?? null,
-      prompt: result?.data?.prompt ?? null,
     });
   } catch (error) {
-    console.error("IMAGE_STATUS_ERROR", error);
+    console.error("GET /v1/ai/image/jobs/:requestId error:", error);
     return sendError(
       res,
       500,
-      error?.message || "Failed to fetch image status"
+      error?.message || "Failed to fetch image job status"
     );
   }
 });
 
-app.post("/v1/ai/video/jobs", async (req, res) => {
-  try {
-    const prompt = String(req.body?.prompt || "").trim();
-    if (!prompt) {
-      return sendError(res, 400, "prompt is required");
-    }
-
-    const aspectRatio = String(req.body?.aspectRatio || "9:16");
-    const resolution = String(req.body?.resolution || "720p");
-    const duration = String(req.body?.duration || "5");
-    const negativePrompt = String(req.body?.negativePrompt || "");
-    const multiShots = Boolean(req.body?.multiShots ?? false);
-    const seed =
-      req.body?.seed === null || req.body?.seed === undefined
-        ? undefined
-        : toNumber(req.body.seed, undefined);
-
-    const input = {
-      prompt,
-      aspect_ratio: aspectRatio,
-      resolution,
-      duration,
-      negative_prompt: negativePrompt,
-      multi_shots: multiShots,
-      enable_prompt_expansion: true,
-      enable_safety_checker: true,
-      ...(seed !== undefined ? { seed } : {}),
-    };
-
-    const result = await fal.queue.submit(VIDEO_MODEL, { input });
-
-    return res.status(202).json({
-      requestId: result.request_id,
-      type: "video",
-      model: VIDEO_MODEL,
-    });
-  } catch (error) {
-    console.error("VIDEO_SUBMIT_ERROR", error);
-    return sendError(
-      res,
-      500,
-      error?.message || "Failed to start video generation"
-    );
-  }
+app.use((req, res) => {
+  res.status(404).json({
+    error: "Route not found",
+    path: req.originalUrl,
+  });
 });
 
-app.get("/v1/ai/video/jobs/:requestId", async (req, res) => {
-  try {
-    const { requestId } = req.params;
-
-    const status = await fal.queue.status(VIDEO_MODEL, {
-      requestId,
-      logs: true,
-    });
-
-    if (status.status !== "COMPLETED") {
-      return res.json({
-        status: status.status,
-        position: status.position ?? null,
-        logs: status.logs ?? [],
-      });
-    }
-
-    const result = await fal.queue.result(VIDEO_MODEL, { requestId });
-    const video = result?.data?.video;
-
-    if (!video?.url) {
-      return sendError(res, 502, "No video URL returned", {
-        data: result?.data ?? null,
-      });
-    }
-
-    return res.json({
-      status: "COMPLETED",
-      url: video.url,
-      width: video.width ?? null,
-      height: video.height ?? null,
-      fps: video.fps ?? null,
-      duration: video.duration ?? null,
-      contentType: video.content_type ?? "video/mp4",
-      seed: result?.data?.seed ?? null,
-      actualPrompt: result?.data?.actual_prompt ?? null,
-    });
-  } catch (error) {
-    console.error("VIDEO_STATUS_ERROR", error);
-    return sendError(
-      res,
-      500,
-      error?.message || "Failed to fetch video status"
-    );
-  }
-});
-
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`AI backend running on port ${PORT}`);
 });
